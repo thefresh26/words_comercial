@@ -1,0 +1,68 @@
+INFORME DE SUBASTA POLYBID — Guía para operadores
+=================================================
+
+Qué es
+------
+Herramienta local para consultar el informe de una subasta y copiarlo
+formateado para pegar en Microsoft Teams.
+
+
+Requisitos en tu PC
+-------------------
+• Python 3.10 o superior instalado
+  - Windows: https://www.python.org/downloads/ (marca "Add Python to PATH")
+  - Mac: suele venir instalado; si no, python.org o "brew install python"
+• Conexión a internet y acceso a la red/VPN de la empresa (para la base de datos)
+
+
+Cómo arrancar (un solo paso)
+----------------------------
+1. Descomprime la carpeta que te enviaron.
+2. Entra en la carpeta "informe_subasta_polybid".
+3. Ejecuta UNO de estos:
+
+   Windows (doble clic):
+     run.bat
+
+   Windows (consola):
+     python run.py
+
+   Mac / Linux:
+     ./run.sh
+     (o: python3 run.py)
+
+4. La primera vez puede tardar 1–2 minutos (instala dependencias solas).
+5. Te pedirá la CONTRASEÑA del vault — te la envían por otro mensaje aparte.
+   Tras escribirla verás asteriscos (*) y luego "Verificando contraseña…".
+   No cierres la ventana negra: puede tardar hasta 1 minuto en abrir el navegador.
+6. Se abrirá el navegador en http://localhost:8501
+
+
+Cómo usar la pantalla
+---------------------
+1. Pega el identificador de la subasta (UUID con guiones).
+2. Pulsa "Consultar".
+3. Pulsa "Copiar informe para Teams".
+4. Abre Teams y pega con Ctrl+V (Windows) o ⌘V (Mac).
+5. Opcional: revisa la vista previa más abajo en la misma página.
+
+
+Si no arranca
+-------------
+• "python no se reconoce": instala Python y reinicia la consola.
+• "Contraseña incorrecta": pide la contraseña de nuevo (mensaje aparte del zip).
+• Error de conexión: conecta la VPN de la empresa e inténtalo otra vez.
+• Tras la contraseña parece colgado: espera 1 minuto; debe salir "Credenciales OK".
+  Si no abre el navegador, entra manualmente a http://localhost:8501
+• El puerto 8501 ocupado: cierra otra ventana de la herramienta o avisa a soporte.
+
+
+Detener la aplicación
+---------------------
+Cierra la ventana negra/consola donde se ejecutó, o pulsa Ctrl+C en esa ventana.
+
+
+No compartas
+------------
+• La contraseña del vault por el mismo canal que el zip.
+• Capturas con datos personales de participantes fuera de los canales autorizados.

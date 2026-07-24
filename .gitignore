@@ -1,0 +1,18 @@
+# Entornos y dependencias
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+
+# Credenciales y configuración local
+credentials.vault.enc
+local.conf
+.env
+
+# Salidas generadas (actas, certificados, informes, juramentadas)
+output/
+
+# Basura del SO / editores
+desktop.ini
+Thumbs.db
+.DS_Store

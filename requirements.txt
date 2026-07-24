@@ -1,0 +1,4 @@
+psycopg[binary]>=3.2
+python-dotenv>=1.0
+streamlit>=1.28
+cryptography>=42.0
