@@ -5,6 +5,10 @@ Uso:
     python scripts/generar_juramentadas.py <auction_uuid>
     python scripts/generar_juramentadas.py ACTIBID-POLI-46-...
     python scripts/generar_juramentadas.py 41742149          (solo cédula)
+    python scripts/generar_juramentadas.py 001-949942        (FMI/matrícula)
+    python scripts/generar_juramentadas.py UNI-0090-2025     (código de unidad)
+
+Si el FMI/unidad tiene varias subastas asociadas, se listan y se pide elegir.
 
 Requisito: 003_FORMATO_DECLARACION_JURAMENTADA_FO_GP_008.docx en templates/.
 Los archivos se guardan en output/juramentadas/
@@ -72,6 +76,91 @@ def _resolver_uuid(conn, identificador: str) -> str:
     raise ValueError(f"No se encontró subasta: {identificador}")
 
 
+def _resolver_identificador(conn, identificador: str) -> str:
+    """Acepta UUID, código de subasta, FMI/número de matrícula, código de
+    inmueble o código de unidad inmobiliaria (UNI-XXXX-AAAA), y devuelve el
+    UUID de la subasta a usar. Si hay varias subastas asociadas al mismo
+    FMI/unidad, se le pide al usuario elegir por consola."""
+    identificador = identificador.strip()
+    try:
+        return _resolver_uuid(conn, identificador)
+    except ValueError:
+        pass
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, grupo_id, codigo, numero_matricula, codigo_grupo, nombre_grupo
+            FROM mst_inmuebles
+            WHERE UPPER(numero_matricula) = UPPER(%s)
+               OR UPPER(codigo) = UPPER(%s)
+               OR UPPER(codigo_grupo) = UPPER(%s)
+               OR UPPER(referencia) = UPPER(%s)
+            """,
+            (identificador, identificador, identificador, identificador),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        raise ValueError(
+            f"No se encontró ninguna subasta, código, FMI ni unidad inmobiliaria "
+            f"con el identificador: {identificador}"
+        )
+
+    inmueble_ids = sorted({r[0] for r in rows if r[0] is not None})
+    grupo_ids = sorted({r[1] for r in rows if r[1] is not None})
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT
+                COALESCE(a.id, psv.auction_id)      AS auction_id,
+                COALESCE(a.code, psv.auction_code)  AS code,
+                COALESCE(a.title, psv.titulo)       AS title,
+                COALESCE(a.status, psv.estado)      AS status,
+                COALESCE(a.start_date, psv.fecha_inicio) AS start_date,
+                COALESCE(a.end_date, psv.fecha_fin)      AS end_date
+            FROM polibid_subastas_v2 psv
+            LEFT JOIN polybid.auctions a ON a.id = psv.auction_id
+            WHERE psv.inmueble_id = ANY(%s)
+               OR (psv.grupo_id IS NOT NULL AND psv.grupo_id = ANY(%s))
+            ORDER BY start_date DESC NULLS LAST
+            """,
+            (inmueble_ids or [-1], grupo_ids or [-1]),
+        )
+        candidatos = cur.fetchall()
+
+    if not candidatos:
+        raise ValueError(
+            f"Se encontró el inmueble/unidad '{identificador}' pero no tiene "
+            f"ninguna subasta asociada."
+        )
+
+    if len(candidatos) == 1:
+        auction_id, code = candidatos[0][0], candidatos[0][1]
+        print(f"✓ Subasta encontrada automáticamente para '{identificador}': {code or auction_id}")
+        return str(auction_id)
+
+    print(f"\n⚠ Se encontraron {len(candidatos)} subastas asociadas a '{identificador}':\n")
+    for i, (aid, code, title, status, start, end) in enumerate(candidatos, start=1):
+        print(f"  [{i}] {code or aid}  |  estado: {status or '—'}  |  {title or '—'}")
+        print(f"       Inicio: {_fmt_fecha_hora(start)}   Fin: {_fmt_fecha_hora(end)}")
+    while True:
+        seleccion = input(f"\nElige el número de subasta a usar (1-{len(candidatos)}): ").strip()
+        if seleccion.isdigit() and 1 <= int(seleccion) <= len(candidatos):
+            return str(candidatos[int(seleccion) - 1][0])
+        print("  ⚠ Opción inválida, intenta de nuevo.")
+
+
+def _fmt_fecha_hora(dt):
+    if not dt:
+        return "—"
+    try:
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(dt)
+
+
 # ── Modo cédula: sin subasta ──────────────────────────────────────────────────
 
 def _desde_cedula(cedula: str) -> list[dict]:
@@ -110,7 +199,7 @@ def _desde_subasta(identificador: str) -> tuple[dict, list[dict]]:
     conn = _conectar()
     from core import fetch_informe
 
-    auction_uuid = _resolver_uuid(conn, identificador)
+    auction_uuid = _resolver_identificador(conn, identificador)
 
     data = fetch_informe(conn, auction_uuid)
     print(f"✓ Subasta: {data['subasta'].get('code')} — {data['subasta'].get('status')}")
@@ -173,7 +262,7 @@ def generar_docx(participante: dict, ruta_salida: Path) -> None:
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: python scripts/generar_juramentadas.py <uuid|codigo|cedula>")
+        print("Uso: python scripts/generar_juramentadas.py <auction_uuid | codigo_subasta | cedula | FMI | codigo_unidad>")
         sys.exit(1)
 
     if not PLANTILLA.exists():

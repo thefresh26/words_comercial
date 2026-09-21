@@ -3,10 +3,19 @@ Genera un ACTA DE CERTIFICACIÓN DE SUBASTA ELECTRÓNICA (.docx)
 usando el archivo original como plantilla.
 
 Uso:
-    python scripts/generar_acta.py <auction_uuid>
+    python generar_acta.py <identificador>
 
-Requisito: ACTA_DE_CERTIFICACIÓN_DE_SUBASTA_ELECTRÓNICA.docx en templates/.
-El archivo se guarda en output/actas/
+Donde <identificador> puede ser:
+    - El UUID de la subasta.
+    - El código de la subasta (ej. ACTIBID-POLI-1-...).
+    - El FMI / número de matrícula de un inmueble individual.
+    - El código de una unidad inmobiliaria (ej. UNI-0090-2025).
+
+Si el FMI o la unidad tienen más de una subasta asociada, el script las
+lista y pide elegir cuál usar.
+
+Requisito: ACTA_DE_CERTIFICACIÓN_DE_SUBASTA_ELECTRÓNICA.docx en la misma carpeta.
+El archivo se guarda en ./actas/
 """
 
 from __future__ import annotations
@@ -17,12 +26,9 @@ import time
 import zipfile
 from pathlib import Path
 
-PROYECTO = Path(__file__).resolve().parent.parent
-CORE_DIR = PROYECTO / "core"
-PLANTILLA = PROYECTO / "templates" / "ACTA_DE_CERTIFICACIÓN_DE_SUBASTA_ELECTRÓNICA.docx"
-SALIDA    = PROYECTO / "output" / "actas"
-
-
+PROYECTO = Path(__file__).parent
+PLANTILLA = PROYECTO.parent / "templates" / "ACTA_DE_CERTIFICACIÓN_DE_SUBASTA_ELECTRÓNICA.docx"
+SALIDA    = PROYECTO.parent / "output" / "actas"
 # ── Slug y scraping ───────────────────────────────────────────────────────────
 
 
@@ -39,6 +45,121 @@ def _resolver_uuid(conn, identificador: str) -> str:
         if row:
             return str(row[0])
     raise ValueError(f"No se encontró subasta con código: {identificador}")
+
+
+def _codigo_unidad_de_grupo(conn, grupo_id_val) -> str | None:
+    """Dado un grupo_id, devuelve el código de la unidad inmobiliaria
+    (formato "UNI-XXXX-AAAA") tomado de mst_inmuebles.codigo_grupo, o None
+    si el grupo no existe o ningún registro tiene ese código."""
+    if not grupo_id_val:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT codigo_grupo
+            FROM mst_inmuebles
+            WHERE grupo_id = %s AND codigo_grupo IS NOT NULL
+            ORDER BY es_padre DESC, id
+            LIMIT 1
+            """,
+            (grupo_id_val,),
+        )
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
+
+
+def _resolver_identificador(conn, identificador: str) -> str:
+    """Acepta UUID de subasta, código de subasta, FMI/número de matrícula
+    de un inmueble individual, código de un inmueble, o código de una
+    unidad inmobiliaria (UNI-XXXX-AAAA), y devuelve el UUID de la subasta
+    a usar.
+
+    Si el identificador corresponde a un FMI/unidad con varias subastas
+    asociadas, se le muestran las opciones al usuario y se le pide elegir
+    (por consola), ya que puede haber más de una subasta para el mismo
+    inmueble o unidad.
+    """
+    identificador = identificador.strip()
+
+    # 1. UUID directo o código de subasta (comportamiento original)
+    try:
+        return _resolver_uuid(conn, identificador)
+    except ValueError:
+        pass
+
+    # 2. FMI / código de inmueble / código de unidad inmobiliaria
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, grupo_id, codigo, numero_matricula, codigo_grupo, nombre_grupo
+            FROM mst_inmuebles
+            WHERE UPPER(numero_matricula) = UPPER(%s)
+               OR UPPER(codigo) = UPPER(%s)
+               OR UPPER(codigo_grupo) = UPPER(%s)
+               OR UPPER(referencia) = UPPER(%s)
+            """,
+            (identificador, identificador, identificador, identificador),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        raise ValueError(
+            f"No se encontró ninguna subasta, código, FMI ni unidad inmobiliaria "
+            f"con el identificador: {identificador}"
+        )
+
+    inmueble_ids = sorted({r[0] for r in rows if r[0] is not None})
+    grupo_ids = sorted({r[1] for r in rows if r[1] is not None})
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT
+                COALESCE(a.id, psv.auction_id)      AS auction_id,
+                COALESCE(a.code, psv.auction_code)  AS code,
+                COALESCE(a.title, psv.titulo)       AS title,
+                COALESCE(a.status, psv.estado)      AS status,
+                COALESCE(a.start_date, psv.fecha_inicio) AS start_date,
+                COALESCE(a.end_date, psv.fecha_fin)      AS end_date
+            FROM polibid_subastas_v2 psv
+            LEFT JOIN polybid.auctions a ON a.id = psv.auction_id
+            WHERE psv.inmueble_id = ANY(%s)
+               OR (psv.grupo_id IS NOT NULL AND psv.grupo_id = ANY(%s))
+            ORDER BY start_date DESC NULLS LAST
+            """,
+            (inmueble_ids or [-1], grupo_ids or [-1]),
+        )
+        candidatos = cur.fetchall()
+
+    if not candidatos:
+        raise ValueError(
+            f"Se encontró el inmueble/unidad '{identificador}' pero no tiene "
+            f"ninguna subasta asociada."
+        )
+
+    if len(candidatos) == 1:
+        auction_id, code = candidatos[0][0], candidatos[0][1]
+        print(f"✓ Subasta encontrada automáticamente para '{identificador}': {code or auction_id}")
+        return str(auction_id)
+
+    print(f"\n⚠ Se encontraron {len(candidatos)} subastas asociadas a '{identificador}':\n")
+    for i, (aid, code, title, status, start, end) in enumerate(candidatos, start=1):
+        print(f"  [{i}] {code or aid}  |  estado: {status or '—'}  |  {title or '—'}")
+        print(f"       Inicio: {_fmt_fecha_hora(start)}   Fin: {_fmt_fecha_hora(end)}")
+    while True:
+        seleccion = input(f"\nElige el número de subasta a usar (1-{len(candidatos)}): ").strip()
+        if seleccion.isdigit() and 1 <= int(seleccion) <= len(candidatos):
+            return str(candidatos[int(seleccion) - 1][0])
+        print("  ⚠ Opción inválida, intenta de nuevo.")
+
+
+def _fmt_fecha_hora(dt) -> str:
+    if not dt:
+        return "—"
+    try:
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(dt)
 
 
 def _slugify(texto: str) -> str:
@@ -73,44 +194,109 @@ def _scrape_fechas(grupo_id, nombre_grupo: str, inm_id=None) -> dict:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-images")
+        options.add_argument("--blink-settings=imagesEnabled=false")
+        options.add_argument("--window-size=1600,1000")
+        options.page_load_strategy = "eager"  # no espera a que carguen imágenes/recursos secundarios
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
         print(f"  → Consultando: {url}")
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=options
-        )
+        # cache_valid_range evita que webdriver_manager revise por internet si
+        # hay una versión nueva del driver en cada corrida — usa la que ya
+        # tiene descargada mientras no pasen 30 días, ahorrando varios segundos.
         try:
+            driver_path = ChromeDriverManager(cache_valid_range=30).install()
+        except TypeError:
+            driver_path = ChromeDriverManager().install()
+        driver = webdriver.Chrome(service=Service(driver_path), options=options)
+        try:
+            driver.set_page_load_timeout(15)
             driver.get(url)
-            time.sleep(3)
-            lineas = driver.find_element(By.TAG_NAME, "body").text.split("\n")
+
+            # Igual que en generar_informe.py: el cronograma carga sus datos
+            # por JS después del render inicial, así que se reintenta leer el
+            # texto de la página hasta ver el cronograma con datos reales
+            # ("COMPLETADO"/fechas), en vez de confiar en un sleep fijo corto
+            # que puede capturar el texto antes de que lleguen esos datos.
+            espera_max = 6.0
+            paso = 0.3
+            transcurrido = 0.0
+            lineas = []
+            while transcurrido < espera_max:
+                time.sleep(paso)
+                transcurrido += paso
+                lineas = driver.find_element(By.TAG_NAME, "body").text.split("\n")
+                texto_actual = "\n".join(lineas)
+                if "Cronograma del proceso" in texto_actual and (
+                    "COMPLETADO" in texto_actual.upper() or "→" in texto_actual
+                ):
+                    break
+            print(f"  [debug] Esperó {transcurrido:.1f}s a que cargara el cronograma "
+                  f"({len(lineas)} líneas capturadas)")
 
             meses_abr = {
                 "ene":"01","feb":"02","mar":"03","abr":"04","may":"05","jun":"06",
-                "jul":"07","ago":"08","sep":"09","oct":"10","nov":"11","dic":"12"
+                "jul":"07","ago":"08","sep":"09","sept":"09","oct":"10","nov":"11","dic":"12"
             }
 
-            # Buscar año en el cronograma general
+            # Índice donde empieza el cronograma (para no buscar el año ni las
+            # fechas en cualquier parte de la página, solo en esa sección).
+            inicio_cron = next(
+                (i for i, l in enumerate(lineas) if "Cronograma del proceso" in l), 0
+            )
+            print(f"  [debug] 'Cronograma del proceso' encontrado en la línea {inicio_cron}")
+            print("  [debug] Líneas desde el cronograma (índice: texto):")
+            for j in range(inicio_cron, min(inicio_cron + 60, len(lineas))):
+                print(f"    [{j}] {lineas[j].strip()!r}")
+
+            # Buscar año SOLO dentro de la sección del cronograma: si se busca
+            # en toda la página se puede agarrar por error un año que no tiene
+            # nada que ver (p. ej. un año de construcción u otro dato numérico
+            # del inmueble que aparezca antes en el texto).
             anio = "2026"
-            for l in lineas:
+            for l in lineas[inicio_cron:]:
                 m = _re.search(r"20\d{2}", l)
                 if m:
                     anio = m.group()
                     break
 
-            # Fecha publicación: fase 1 del cronograma
+            def _siguiente_no_vacia(desde: int) -> int | None:
+                """Índice de la siguiente línea no vacía a partir de 'desde'
+                (el sitio deja líneas en blanco entre el nombre de la fase,
+                el rango de fechas y el mes)."""
+                j = desde
+                while j < len(lineas) and not lineas[j].strip():
+                    j += 1
+                return j if j < len(lineas) else None
+
+            # Fecha publicación: fase 1 del cronograma. El sitio tiene dos
+            # variantes: las páginas de unidad inmobiliaria todavía muestran
+            # "Publicación próxima en subasta" como fase 1; las páginas de
+            # inmueble individual le quitaron esa fase y ahora empiezan
+            # directo en "Registro y cargue de documentos". En vez de atarse
+            # al nombre exacto de la fase 1, se usa siempre la fecha de la
+            # fase que abre el cronograma, sea cual sea su nombre.
+            idx_fase1_nombre = None
             for i, linea in enumerate(lineas):
-                if "Publicación próxima en subasta" in linea:
-                    try:
-                        rango = lineas[i+1].strip()
-                        mes_l = lineas[i+2].strip()
-                        dia = rango.split()[0].zfill(2)
-                        mes = meses_abr.get(mes_l.split(".")[0].strip(), "00")
-                        resultado["publicacion"] = f"{dia}/{mes}/{anio} 10:00 am"
-                        print(f"  → Publicación: {resultado['publicacion']}")
-                    except Exception:
-                        pass
+                if i < inicio_cron:
+                    continue
+                if "Publicación próxima en subasta" in linea or "Registro y cargue de documentos" in linea:
+                    idx_fase1_nombre = i
                     break
+
+            if idx_fase1_nombre is not None:
+                try:
+                    idx_rango = _siguiente_no_vacia(idx_fase1_nombre + 1)
+                    idx_mes = _siguiente_no_vacia(idx_rango + 1) if idx_rango is not None else None
+                    rango = lineas[idx_rango].strip()
+                    mes_l = lineas[idx_mes].strip()
+                    dia = rango.split()[0].zfill(2)
+                    mes = meses_abr.get(mes_l.split(".")[0].strip(), "00")
+                    resultado["publicacion"] = f"{dia}/{mes}/{anio} 10:00 am"
+                    print(f"  → Publicación: {resultado['publicacion']}")
+                except Exception:
+                    pass
 
             # Fechas apertura y cierre: después de "Estado de la Subasta"
             encontre_estado = False
@@ -133,6 +319,37 @@ def _scrape_fechas(grupo_id, nombre_grupo: str, inm_id=None) -> dict:
             if len(fechas_subasta) >= 2:
                 resultado["cierre"] = fechas_subasta[1]
                 print(f"  → Cierre: {resultado['cierre']}")
+
+            # Respaldo: si no hay sección "Estado de la Subasta" (pasa en
+            # subastas ya finalizadas, el sitio deja de mostrarla), se usa la
+            # última tarjeta del cronograma, "Subasta (apertura y cierre)"
+            # — se busca la frase completa (no solo "Subasta") para no
+            # confundirla con la fase 1 ("Publicación próxima en subasta").
+            if resultado["apertura"] == "—" or resultado["cierre"] == "—":
+                for i, linea in enumerate(lineas):
+                    if i < inicio_cron:
+                        continue
+                    if "subasta (apertura y cierre)" in linea.lower():
+                        try:
+                            idx_rango = _siguiente_no_vacia(i + 1)
+                            idx_mes = _siguiente_no_vacia(idx_rango + 1) if idx_rango is not None else None
+                            rango = lineas[idx_rango].strip()
+                            mes_l = lineas[idx_mes].strip()
+                            mes = meses_abr.get(mes_l.split(".")[0].strip(), "00")
+                            if "→" in rango:
+                                partes = rango.split()
+                                dia_i, dia_f = partes[0].zfill(2), partes[2].zfill(2)
+                            else:
+                                dia_i = dia_f = rango.split()[0].zfill(2)
+                            if resultado["apertura"] == "—":
+                                resultado["apertura"] = f"{dia_i}/{mes}/{anio}"
+                                print(f"  [debug] Apertura tomada de la fase 'Subasta (apertura y cierre)': {resultado['apertura']}")
+                            if resultado["cierre"] == "—":
+                                resultado["cierre"] = f"{dia_f}/{mes}/{anio}"
+                                print(f"  [debug] Cierre tomado de la fase 'Subasta (apertura y cierre)': {resultado['cierre']}")
+                        except Exception:
+                            pass
+                        break
 
             # Extraer dirección física de la sección Ubicación
             for i, linea in enumerate(lineas):
@@ -171,16 +388,20 @@ def _convertir_fecha_espanol(texto: str) -> str:
 # ── Conexión ──────────────────────────────────────────────────────────────────
 
 def conectar(auction_uuid: str):
-    sys.path.insert(0, str(CORE_DIR))
+    sys.path.insert(0, str(PROYECTO.parent / "core"))
+    sys.path.insert(0, str(PROYECTO.parent))
     from core import get_connection, fetch_informe, load_dotenv_files
     from vault import read_vault, decrypt_payload, dsn_from_database_section
 
     load_dotenv_files()
 
     dsn = None
-    vault_path = PROYECTO / "credentials.vault.enc"
-    local_conf = PROYECTO / "local.conf"
-    if vault_path.is_file():
+    vault_path = PROYECTO.parent / "credentials.vault.enc"
+    local_conf_path = PROYECTO.parent / "local.conf"
+    if local_conf_path.is_file():
+        # Si existe local.conf, se usa directamente y no se pregunta nada.
+        dsn = None
+    elif vault_path.is_file():
         try:
             password = input("Contraseña del vault (Enter para omitir): ").strip()
             if password:
@@ -192,10 +413,9 @@ def conectar(auction_uuid: str):
             print("  ⚠ Vault falló, usando local.conf")
             dsn = None
 
-    local_conf_path = PROYECTO / "local.conf"
     conn = get_connection(dsn, local_conf_path if local_conf_path.is_file() else None)
     print("✓ Conectado a la base de datos")
-    auction_uuid = _resolver_uuid(conn, auction_uuid)
+    auction_uuid = _resolver_identificador(conn, auction_uuid)
 
     data = fetch_informe(conn, auction_uuid)
     print(f"✓ Subasta: {data['subasta'].get('code')} — {data['subasta'].get('status')}")
@@ -217,7 +437,7 @@ def _obtener_datos_acta(conn, auction_uuid: str, data: dict) -> dict:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT psv.contact_tercero_id, psv.inmueble_id,
+            SELECT psv.contact_tercero_id, psv.inmueble_id, psv.grupo_id,
                    ct.direccion_principal
             FROM polibid_subastas_v2 psv
             LEFT JOIN contact_terceros ct ON ct.id = psv.contact_tercero_id
@@ -229,8 +449,9 @@ def _obtener_datos_acta(conn, auction_uuid: str, data: dict) -> dict:
         link = cur.fetchone()
         direccion = "—"
         if link:
-            direccion = link[2] or "—"
+            direccion = link[3] or "—"
             if link[1]:
+                # Subasta de un inmueble individual (no agrupado).
                 cur.execute(
                     """
                     SELECT codigo, numero_matricula, referencia, grupo_id, nombre_grupo, referencia
@@ -246,6 +467,33 @@ def _obtener_datos_acta(conn, auction_uuid: str, data: dict) -> dict:
                         "codigo":      row[0] or "—",
                         "fmi":         row[1] or "—",
                         "nombre_grupo": row[4] or row[2] or "—",
+                    }
+            elif link[2]:
+                # Subasta de una unidad inmobiliaria agrupada: psv.inmueble_id
+                # es NULL en estos casos (es normal, no un error) y el vínculo
+                # correcto es psv.grupo_id. Antes de este fix, al no revisar
+                # este caso, el código caía al fallback de manifestacion_interes
+                # (otra tabla, sin relación garantizada con lo realmente
+                # subastado) y podía traer los datos de OTRA propiedad.
+                cur.execute(
+                    """
+                    SELECT id, codigo, numero_matricula, grupo_id, nombre_grupo,
+                           referencia, codigo_grupo
+                    FROM mst_inmuebles WHERE grupo_id = %s ORDER BY es_padre DESC, id
+                    """,
+                    (link[2],),
+                )
+                rows_g = cur.fetchall()
+                if rows_g:
+                    r = rows_g[0]
+                    grupo_id = r[3]
+                    nombre_grupo = r[4] or r[5] or ""
+                    codigo_inm = r[6] or r[1] or "—"
+                    fmi_inm = ", ".join(x[2] for x in rows_g if x[2])
+                    inmueble = {
+                        "codigo": codigo_inm,
+                        "fmi": fmi_inm,
+                        "nombre_grupo": nombre_grupo,
                     }
         inmueble["direccion"] = inmueble.get("nombre_grupo", direccion)
 
@@ -291,12 +539,38 @@ def _obtener_datos_acta(conn, auction_uuid: str, data: dict) -> dict:
                             inmueble = {"codigo": r[1] or "—", "fmi": r[2] or "—",
                                         "nombre_grupo": nombre_grupo, "direccion": nombre_grupo}
 
+    # 1.b Unidad inmobiliaria: si el inmueble pertenece a un grupo (varios
+    # FMIs agrupados bajo un grupo_id), el campo ##fmi## del acta debe
+    # mostrar el CÓDIGO DE LA UNIDAD (formato "UNI-XXXX-AAAA"), no la lista
+    # de folios de matrícula individuales — así lo pidió el usuario.
+    if grupo_id:
+        codigo_unidad = _codigo_unidad_de_grupo(conn, grupo_id)
+        if codigo_unidad:
+            inmueble["fmi"] = codigo_unidad
+
     # 2. Fechas via scraping
     print(f"\nObteniendo fechas desde la página...")
     fechas = _scrape_fechas(grupo_id, nombre_grupo, inm_id=link[1] if link else None)
-    fecha_publicacion = fechas.get("publicacion", "—")
     fecha_apertura = fechas.get("apertura", "—")
     fecha_cierre = fechas.get("cierre", "—")
+
+    # La fecha de publicación se toma PRIMERO del cronograma scrapeado de la
+    # página (fecha real de inicio del proceso). Solo si la página no trae
+    # ningún dato de cronograma (pasa con subastas ya finalizadas cuya URL
+    # el sitio reutilizó para un ciclo de venta nuevo de la misma propiedad)
+    # se usa como respaldo el created_at de la subasta en la base de datos
+    # — que no es exactamente lo mismo, pero es mejor que dejarlo en blanco.
+    fecha_publicacion = fechas.get("publicacion", "—")
+    if fecha_publicacion == "—":
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT created_at FROM polybid.auctions WHERE id = %s::uuid",
+                (auction_uuid,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                fecha_publicacion = f"{row[0].day:02d}/{row[0].month:02d}/{row[0].year} " \
+                                     f"{row[0].strftime('%I:%M %p').lstrip('0').lower()}"
 
     # 3. Participantes
     participantes = []
@@ -481,21 +755,21 @@ def generar_docx(datos: dict, ruta_salida: Path) -> None:
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: python generar_acta.py <auction_uuid>")
+        print("Uso: python generar_acta.py <auction_uuid | codigo_subasta | FMI | codigo_unidad>")
         sys.exit(1)
 
     if not PLANTILLA.exists():
         print(f"✗ No se encuentra la plantilla: {PLANTILLA.name}")
         sys.exit(1)
 
-    auction_uuid = sys.argv[1].strip()
+    identificador = sys.argv[1].strip()
 
     print(f"\n{'='*55}")
     print(f"  GENERADOR DE ACTA DE CERTIFICACIÓN")
     print(f"{'='*55}")
-    print(f"  Subasta: {auction_uuid}\n")
+    print(f"  Identificador: {identificador}\n")
 
-    data, datos = conectar(auction_uuid)
+    data, datos = conectar(identificador)
 
     SALIDA.mkdir(exist_ok=True)
     codigo = datos["codigo_subasta"]

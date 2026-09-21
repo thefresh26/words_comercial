@@ -16,16 +16,9 @@ scripts/               Generadores de documentos (uno por tipo de documento)
   generar_informe.py
   generar_juramentadas.py
 
-utils/                 Diagnósticos y herramientas auxiliares
-  diagnostico_46.py
-  diagnostico_cronograma.py
-  diagnostico_fmis.py
-  debug_cronograma.py
-  mapeo_pagina.py
-  buscar_participante.py
-  test_scraping.py
-  informe_subasta_polybid.py   (CLI del informe)
-  _dd_builder.mjs               (helper Node para armar .docx de certificados)
+utils/               Herramientas auxiliares
+  informe_subasta_polybid.py   (CLI del informe, sin interfaz web)
+  clarity_capture.py            (estadísticas de tráfico de Microsoft Clarity)
 
 templates/              Plantillas .docx originales usadas para generar cada documento
   002_CERTIFICADO_RESULTADO_DD.docx
@@ -75,13 +68,16 @@ Esto crea/activa un entorno virtual (`.venv`), instala dependencias, pide la con
 
 ### Generar documentos por línea de comandos
 
-Cada script recibe el UUID (o código) de la subasta:
+Cada script recibe el UUID de la subasta, su código (ACTIBID-...), un
+FMI/número de matrícula, el código de un inmueble individual, o el código
+de una unidad inmobiliaria (UNI-XXXX-AAAA). Si el FMI/unidad tiene varias
+subastas asociadas, el script las lista y pide elegir cuál usar:
 
 ```bash
-python scripts/generar_acta.py <auction_uuid>
-python scripts/generar_certificados_dd.py <auction_uuid>
-python scripts/generar_informe.py <auction_uuid>
-python scripts/generar_juramentadas.py <auction_uuid|cedula>
+python scripts/generar_acta.py <identificador>
+python scripts/generar_certificados_dd.py <identificador>
+python scripts/generar_informe.py <identificador>
+python scripts/generar_juramentadas.py <identificador|cedula>
 ```
 
 Los documentos generados se guardan en `output/actas/`, `output/certificados_dd/`, `output/informes/` y `output/juramentadas/` respectivamente.
