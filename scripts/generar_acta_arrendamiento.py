@@ -105,8 +105,19 @@ def _texto_pdf(ruta: Path) -> str:
     # con la tolerancia por defecto de pdfplumber (3), las palabras quedan
     # pegadas sin espacio (ej. "Localmedianeroubicado..."). Con tolerancia 1
     # sí separa bien las palabras.
-    with pdfplumber.open(str(ruta)) as pdf:
-        texto = "\n".join(p.extract_text(x_tolerance=1) or "" for p in pdf.pages)
+    try:
+        with pdfplumber.open(str(ruta)) as pdf:
+            texto = "\n".join(p.extract_text(x_tolerance=1) or "" for p in pdf.pages)
+    except Exception as e:
+        # El archivo encontrado no es un PDF válido (o está corrupto/es en
+        # realidad una imagen con extensión equivocada, como pasó con un
+        # "SAGRILAF APROBADO ....png" que se coló como si fuera el
+        # Aprobado/Póliza) -- antes esto tronaba el caso entero; ahora se
+        # trata igual que un documento sin texto legible, y quien llama ya
+        # sabe caer a "—"/None y avisar en pendientes en vez de insertar
+        # datos a la fuerza.
+        print(f"    ⚠ No se pudo leer '{ruta.name}' como PDF ({e}); se trata como si no tuviera texto.")
+        texto = ""
     if len(texto.strip()) < 20:
         # Probablemente un PDF escaneado (imagen) sin capa de texto -- se
         # intenta OCR antes de devolver vacío, para no perder datos que sí
@@ -740,6 +751,16 @@ def generar_caso(caso: dict, identificador: str | int) -> Path:
 
     if caso.get("aprobado"):
         datos_aprobado = extraer_de_aprobado(caso["aprobado"])
+        if datos_aprobado["arrendatario_nombre"] == "—" and datos_aprobado["id_numero"] == "—":
+            # Se encontró el archivo, pero no se le pudo sacar nada (no es
+            # un PDF válido/legible, o no trae el formato "DATOS DEL
+            # ARRENDATARIO" esperado) -- se avisa en vez de dejarlo en
+            # silencio con puros "—".
+            pendientes.append(
+                f"Se encontró '{caso['aprobado'].name}' como Aprobado/Póliza, pero no se le pudo extraer "
+                "el nombre ni la cédula/NIT del arrendatario (revisar si es el documento correcto, o si "
+                "está escaneado sin texto legible); completar a mano."
+            )
     else:
         # No hay Aprobado/Póliza -- se prueban, EN ORDEN, todos los demás
         # documentos de la carpeta que puedan traer nombre/cédula/ciudad de
@@ -1135,7 +1156,7 @@ def _archivo_aprobado_poliza(carpeta: Path) -> Path | None:
         candidatos = sorted(p for p in c.iterdir() if p.is_file())
         for f in candidatos:
             n = f.name.upper()
-            if "APROBADO" in n and "SAGRILAFT" not in n:
+            if "APROBADO" in n and "SAGRILAF" not in n:
                 return f
     return None
 
