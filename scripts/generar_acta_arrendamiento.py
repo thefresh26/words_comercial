@@ -702,11 +702,29 @@ def generar_caso(caso: dict, identificador: str | int) -> Path:
     temporales de imágenes de cada caso no se pisen entre sí (puede ser
     cualquier texto/número único, ej. el FMI o el índice del caso en el
     lote)."""
-    datos_estimado = extraer_de_estimado_renta(
-        caso["estimado_renta"],
-        fmi_conocido=caso.get("fmi_conocido"),
-        territorial_conocida=caso.get("territorial_conocida"),
-    )
+    if caso["estimado_renta"] is not None:
+        datos_estimado = extraer_de_estimado_renta(
+            caso["estimado_renta"],
+            fmi_conocido=caso.get("fmi_conocido"),
+            territorial_conocida=caso.get("territorial_conocida"),
+        )
+    else:
+        # No hay Estimado de Renta: se arma el mismo dict que produciría
+        # extraer_de_estimado_renta() para un documento del que no se pudo
+        # sacar nada, usando lo que sí se conoce por fuera (FMI buscado,
+        # territorial de la ruta de carpetas) en vez de dejarlo todo en "—".
+        fmi_base = caso.get("fmi_conocido") or "—"
+        m_fmi_base = re.match(r"([\d]{2,3}[A-Za-z]?-\d+)", fmi_base)
+        territorial_base = caso.get("territorial_conocida") or "—"
+        datos_estimado = {
+            "fmi": fmi_base,
+            "fmi_limpio": m_fmi_base.group(1) if m_fmi_base else fmi_base,
+            "direccion": "—",
+            "ciudad": "—",
+            "direccion_territorial": territorial_base.upper() if territorial_base != "—" else territorial_base,
+            "tipo_bien": "—",
+            "categoria_contrato": "—",
+        }
 
     # "fmi_forzado": a diferencia de "fmi_conocido" (que solo se usa si la
     # extracción del texto falla), este SIEMPRE reemplaza el FMI extraído.
@@ -767,7 +785,9 @@ def generar_caso(caso: dict, identificador: str | int) -> Path:
 
     tipo_contrato = caso.get("tipo_contrato_forzado") or f"CONTRATO {datos_estimado['categoria_contrato']}".strip()
 
-    descripcion = caso.get("descripcion_forzada") or extraer_descripcion_estimado_renta(caso["estimado_renta"])
+    descripcion = caso.get("descripcion_forzada") or (
+        extraer_descripcion_estimado_renta(caso["estimado_renta"]) if caso["estimado_renta"] else None
+    )
     if not descripcion:
         descripcion = (
             "No se pudo extraer automáticamente la descripción del Estimado de Renta; "
@@ -785,7 +805,10 @@ def generar_caso(caso: dict, identificador: str | int) -> Path:
     # completa, porque eso no es "una foto del inmueble" sino el documento
     # entero (tablas, firmas, etc.), y sería engañoso insertarlo como si lo
     # fuera.
-    fotos_inmueble = extraer_fotos_inmueble(caso["estimado_renta"], f"estimado_{identificador}")
+    fotos_inmueble = (
+        extraer_fotos_inmueble(caso["estimado_renta"], f"estimado_{identificador}")
+        if caso["estimado_renta"] else []
+    )
 
     if caso.get("aprobado"):
         imagen_aprobado = _pdf_a_png(caso["aprobado"], f"aprobado_{identificador}")
@@ -900,7 +923,10 @@ def generar_caso(caso: dict, identificador: str | int) -> Path:
     # completo del Estimado de Renta (todas sus páginas, como imagen) --
     # confirmado por el usuario que así está bien.
     marcador_adicionales = "##foto_estimado_renta_(si hay mas se colocan todas)##"
-    paginas_estimado_renta = _pdf_a_png_todas_paginas(caso["estimado_renta"], f"docestimado_{identificador}")
+    paginas_estimado_renta = (
+        _pdf_a_png_todas_paginas(caso["estimado_renta"], f"docestimado_{identificador}")
+        if caso["estimado_renta"] else []
+    )
     if not _insertar_imagenes_en_marcador(doc, marcador_adicionales, paginas_estimado_renta):
         for p in doc.paragraphs:
             _reemplazar_texto_parrafo(p, {marcador_adicionales: SIN_IMAGEN})
@@ -1204,10 +1230,17 @@ def _construir_caso_desde_carpeta(carpeta: Path, fmi_conocido: str, indice: int,
     carta_juramentada = None if aprobado else _archivo_carta_juramentada(carpeta)
     territorial_conocida = _territorial_de_ruta(carpeta)
 
+    pendientes_estimado: list[str] = []
     if estimado is None:
-        # El Estimado de Renta es indispensable (de ahí sale FMI, tipo de bien,
-        # dirección, descripción y fotos) -- sin eso no hay caso que generar.
-        raise FileNotFoundError(f"No se encontró el Estimado de Renta en: {carpeta}")
+        # Antes esto abortaba el caso entero. Ahora se genera igual el Acta:
+        # el FMI/tipo de bien/dirección/descripción/fotos que normalmente
+        # salen de este documento quedan en "—" (o con el FMI/territorial
+        # que ya se conocían por la carpeta) y con un pendiente para
+        # completarlos a mano -- ver generar_caso().
+        pendientes_estimado.append(
+            f"No se encontró el Estimado de Renta en la carpeta ({carpeta.name}); el tipo de bien, "
+            "dirección, descripción y fotos del inmueble quedaron en '—' -- completar a mano."
+        )
     # El documento de Aprobado/Póliza puede faltar (p. ej. Juan Gregory Blandón,
     # que solo tiene el soporte de SAGRILAFT en su carpeta). En ese caso se
     # genera igual el Acta, con el nombre/cédula del arrendatario en "—" y un
@@ -1224,13 +1257,16 @@ def _construir_caso_desde_carpeta(carpeta: Path, fmi_conocido: str, indice: int,
     )
     if fmi_forzado:
         caso["fmi_forzado"] = fmi_forzado
+    notas_extra = list(pendientes_estimado)
     if fmis_extra:
         nombres_extra = ", ".join(f"{fmi} ({c.name})" for fmi, c in zip(fmis_extra, carpetas_extra or []))
-        caso["pendientes_extra"] = [
+        notas_extra.append(
             f"Este caso también cubre el/los FMI adicional(es) {nombres_extra}, detectado(s) como la "
             "misma unidad/negocio por compartir nombre de arrendatario/empresa en la carpeta; verificar "
             "que no se necesite mencionarlos en el cuerpo del Acta."
-        ]
+        )
+    if notas_extra:
+        caso["pendientes_extra"] = notas_extra
     return caso
 
 
@@ -1284,7 +1320,7 @@ def procesar_entrada(entrada: str, indice: int) -> int:
             indice += 1
             continue
 
-        print(f"  Estimado de Renta: {caso['estimado_renta'].name}")
+        print(f"  Estimado de Renta: {caso['estimado_renta'].name if caso['estimado_renta'] else '(NO ENCONTRADO -- queda pendiente a mano)'}")
         print(f"  Aprobado/Póliza:   {caso['aprobado'].name if caso['aprobado'] else '(NO ENCONTRADO -- queda pendiente a mano)'}")
         print(f"  SAGRILAFT imagen:  {caso['sagrilaft_imagen'].name if caso['sagrilaft_imagen'] else '(no encontrada)'}")
 
